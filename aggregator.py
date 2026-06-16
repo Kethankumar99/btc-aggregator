@@ -1,6 +1,6 @@
 # ============================================
-# BTC 5-MIN BLOCK AGGREGATOR - WEBSOCKET + TELEGRAM CONFIRMATION
-# REAL-TIME TRADES - NO MISSING DATA
+# BTC 5-MIN BLOCK AGGREGATOR - WEBSOCKET + CORRECT BLOCK TIMING
+# FIX: BLOCK TIME UPDATE ISSUE
 # ============================================
 
 import requests
@@ -24,7 +24,7 @@ TELEGRAM_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
 
 def send_telegram_message(message):
-    """Send message to Telegram"""
+    """Send message to Telegram - Plain text version"""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️ Telegram credentials not set")
         return False
@@ -34,7 +34,7 @@ def send_telegram_message(message):
         payload = {
             'chat_id': TELEGRAM_CHAT_ID,
             'text': message,
-            'parse_mode': 'HTML'
+            # 'parse_mode': 'HTML'  # Disabled to avoid HTML errors
         }
         response = requests.post(url, json=payload, timeout=10)
         if response.status_code == 200:
@@ -46,6 +46,21 @@ def send_telegram_message(message):
     except Exception as e:
         print(f"❌ Telegram error: {e}")
         return False
+
+def send_connection_message():
+    """Send connection confirmation to Telegram"""
+    message = f"""
+🚀 BTC AGGREGATOR CONNECTED!
+
+✅ Status: Connected to Binance WebSocket
+💰 Symbol: BTCUSDT
+⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+📊 Mode: Real-time trades
+⚡ Alert Rules: NET BTC > 50 or < -50
+
+✅ Bot is running!
+    """
+    send_telegram_message(message)
 
 # ============================================
 # HEALTH CHECK FOR RENDER
@@ -85,13 +100,16 @@ class BTCAggregator:
         self.last_trade_id = None
         self.is_running = True
         self.last_alert_time = None
-        self.alert_cooldown = 300  # 5 minutes
+        self.alert_cooldown = 300
         self.block_count = 0
         self.total_trades_received = 0
         
-        # Trade buffer - stores all trades
+        # Trade buffer
         self.trade_buffer = deque(maxlen=100000)
         self.buffer_lock = threading.Lock()
+        
+        # ⭐ Block processing lock - prevents duplicate blocks
+        self.block_lock = threading.Lock()
         
         # Initialize block
         self.reset_block()
@@ -100,75 +118,10 @@ class BTCAggregator:
         self.csv_file = f"5min_blocks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         self.init_csv()
         
-        # ⭐ Send connection confirmation to Telegram
-        self.send_connection_message()
-        
         print(f"🚀 Initialized aggregator for {symbol}")
 
-    def send_connection_message(self):
-        """Send connection confirmation to Telegram"""
-        message = f"""
-🚀 <b>BTC AGGREGATOR CONNECTED!</b>
-
-✅ <b>Status:</b> Connected to Binance WebSocket
-💰 <b>Symbol:</b> {self.symbol}
-⏰ <b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-
-📊 <b>Mode:</b> Real-time trades
-⚡ <b>Alert Rules:</b>
-• NET BTC > 50 → 🔥 STRONG BUY
-• NET BTC < -50 → ❄️ STRONG SELL
-
-✅ <b>Bot is running!</b>
-        """
-        send_telegram_message(message)
-        print("📨 Connection confirmation sent to Telegram")
-
-    def send_block_alert(self, net_volume, avg_price, buy_percent, sell_percent):
-        """Send alert when threshold crossed"""
-        if self.last_alert_time:
-            if (datetime.now() - self.last_alert_time).seconds < self.alert_cooldown:
-                return
-        
-        if net_volume > 50:
-            self.last_alert_time = datetime.now()
-            message = f"""
-🔴 <b>🔥 EXTREME BUY ALERT!</b>
-
-📊 <b>5-Minute Block Analysis</b>
-⏰ {self.block['start_time'].strftime('%H:%M:%S')} → {self.block['end_time'].strftime('%H:%M:%S')}
-
-🟢 <b>BUYS:</b> {self.block['buy_count']} trades | {self.block['buy_volume']:.4f} BTC
-🔴 <b>SELLS:</b> {self.block['sell_count']} trades | {self.block['sell_volume']:.4f} BTC
-📊 <b>NET VOLUME:</b> <b>+{net_volume:.4f} BTC</b> 🚀
-
-💰 <b>AVG PRICE:</b> ${avg_price:,.2f}
-📈 <b>BUY %:</b> {buy_percent:.1f}% | <b>SELL %:</b> {sell_percent:.1f}%
-
-⚡ <b>SIGNAL:</b> <b>🔥 STRONG BUY - NET BTC > 50!</b>
-            """
-            send_telegram_message(message)
-            
-        elif net_volume < -50:
-            self.last_alert_time = datetime.now()
-            message = f"""
-🔴 <b>❄️ EXTREME SELL ALERT!</b>
-
-📊 <b>5-Minute Block Analysis</b>
-⏰ {self.block['start_time'].strftime('%H:%M:%S')} → {self.block['end_time'].strftime('%H:%M:%S')}
-
-🟢 <b>BUYS:</b> {self.block['buy_count']} trades | {self.block['buy_volume']:.4f} BTC
-🔴 <b>SELLS:</b> {self.block['sell_count']} trades | {self.block['sell_volume']:.4f} BTC
-📊 <b>NET VOLUME:</b> <b>{net_volume:.4f} BTC</b> 📉
-
-💰 <b>AVG PRICE:</b> ${avg_price:,.2f}
-📈 <b>BUY %:</b> {buy_percent:.1f}% | <b>SELL %:</b> {sell_percent:.1f}%
-
-⚡ <b>SIGNAL:</b> <b>❄️ STRONG SELL - NET BTC < -50!</b>
-            """
-            send_telegram_message(message)
-
     def reset_block(self):
+        """Reset block data"""
         self.block = {
             'start_time': None,
             'end_time': None,
@@ -184,6 +137,7 @@ class BTCAggregator:
             'trade_count': 0
         }
         self.block_completed = False
+        self.block_processed = False  # ⭐ New flag
 
     def init_csv(self):
         try:
@@ -220,7 +174,7 @@ class BTCAggregator:
                     'isBuyerMaker': data['m']
                 }
                 
-                # ⭐ Add to buffer immediately
+                # Add to buffer
                 with self.buffer_lock:
                     self.trade_buffer.append(trade)
                     self.total_trades_received += 1
@@ -229,8 +183,9 @@ class BTCAggregator:
                 if self.last_trade_id is None or trade['id'] > self.last_trade_id:
                     self.last_trade_id = trade['id']
                 
-                # ⭐ Process trade directly for faster block building
-                self.process_trade(trade)
+                # ⭐ Process trade with lock
+                with self.block_lock:
+                    self.process_trade(trade)
                 
         except json.JSONDecodeError:
             pass
@@ -240,15 +195,10 @@ class BTCAggregator:
     def on_ws_error(self, ws, error):
         print(f"❌ WS Error: {error}")
         self.ws_connected = False
-        # Send error alert to Telegram
-        send_telegram_message(f"⚠️ WebSocket Error: {error}\nReconnecting...")
 
     def on_ws_close(self, ws, close_status_code, close_msg):
         print(f"🔌 WS Closed: {close_status_code} - {close_msg}")
         self.ws_connected = False
-        # Send disconnect alert to Telegram
-        send_telegram_message(f"⚠️ WebSocket Disconnected\nReconnecting in 5 seconds...")
-        # Try to reconnect
         time.sleep(5)
         if self.is_running:
             self.connect_websocket()
@@ -256,8 +206,6 @@ class BTCAggregator:
     def on_ws_open(self, ws):
         print("✅ WebSocket connected! Real-time trades coming...")
         self.ws_connected = True
-        # Send success message to Telegram
-        send_telegram_message(f"✅ WebSocket Connected!\nReal-time trades are coming...")
 
     def connect_websocket(self):
         """Connect to Binance WebSocket"""
@@ -272,21 +220,18 @@ class BTCAggregator:
                 on_close=self.on_ws_close
             )
             
-            # Run WebSocket in separate thread
             self.ws_thread = threading.Thread(target=self.ws.run_forever)
             self.ws_thread.daemon = True
             self.ws_thread.start()
             
-            # Wait for connection
             time.sleep(3)
             
         except Exception as e:
             print(f"❌ WebSocket connection failed: {e}")
             self.ws_connected = False
-            send_telegram_message(f"❌ WebSocket Connection Failed: {e}")
 
     # ============================================
-    # TRADE PROCESSING
+    # TRADE PROCESSING - FIXED
     # ============================================
     
     def process_trade(self, trade):
@@ -296,14 +241,25 @@ class BTCAggregator:
         qty = trade['qty']
         is_buy = not trade['isBuyerMaker']
         
-        # Set block start time
+        # ⭐ Check if block is complete - if yes, reset
+        if self.block_completed:
+            # Wait for next block
+            return
+        
+        # Set block start time - ONLY if not set
         if self.block['start_time'] is None:
+            # Calculate block start (5-minute interval)
             minute = (trade_time.minute // 5) * 5
             block_start = trade_time.replace(minute=minute, second=0, microsecond=0)
             self.block['start_time'] = block_start
             self.block['end_time'] = block_start + timedelta(minutes=5)
-            self.block_completed = False
-            print(f"⏰ Block started: {block_start.strftime('%H:%M:%S')}")
+            print(f"⏰ Block started: {block_start.strftime('%H:%M:%S')} → {self.block['end_time'].strftime('%H:%M:%S')}")
+        
+        # ⭐ CRITICAL: Check if trade belongs to current block
+        if trade_time >= self.block['end_time']:
+            # Block is complete - process it
+            self.save_and_print_block()
+            return
         
         # Update counts
         if is_buy:
@@ -321,27 +277,26 @@ class BTCAggregator:
         self.block['total_volume'] += qty
         self.block['trade_count'] += 1
         
-        # Check if block is complete
-        if not self.block_completed and self.is_block_complete():
+        # ⭐ Check if block is complete based on time
+        current_time = datetime.now()
+        if current_time >= self.block['end_time'] and not self.block_completed:
             self.save_and_print_block()
-    
-    def is_block_complete(self):
-        if self.block['start_time'] is None:
-            return False
-        if self.block_completed:
-            return False
-        return datetime.now() >= self.block['end_time']
 
     def save_and_print_block(self):
-        """Save block and send alerts"""
-        if self.block['trade_count'] == 0:
+        """Save block and send alerts - SINGLE EXECUTION"""
+        # ⭐ Prevent multiple executions
+        if self.block_completed:
             return
         
-        # Mark as completed
+        if self.block['trade_count'] == 0:
+            self.block_completed = True
+            return
+        
+        # Mark as completed immediately
         self.block_completed = True
         
         # Calculate metrics
-        avg_price = self.block['price_sum'] / self.block['price_count']
+        avg_price = self.block['price_sum'] / self.block['price_count'] if self.block['price_count'] > 0 else 0
         total_trades = self.block['buy_count'] + self.block['sell_count']
         buy_percent = (self.block['buy_count'] / total_trades * 100) if total_trades > 0 else 0
         sell_percent = 100 - buy_percent
@@ -380,7 +335,41 @@ class BTCAggregator:
         sys.stdout.flush()
         
         # Send alert if threshold crossed
-        self.send_block_alert(net_volume, avg_price, buy_percent, sell_percent)
+        if net_volume > 50:
+            alert = f"""
+🔴 EXTREME BUY ALERT!
+
+5-Minute Block Analysis
+⏰ {self.block['start_time'].strftime('%H:%M:%S')} → {self.block['end_time'].strftime('%H:%M:%S')}
+
+BUYS: {self.block['buy_count']} trades | {self.block['buy_volume']:.4f} BTC
+SELLS: {self.block['sell_count']} trades | {self.block['sell_volume']:.4f} BTC
+NET VOLUME: +{net_volume:.4f} BTC 🚀
+
+AVG PRICE: ${avg_price:,.2f}
+BUY %: {buy_percent:.1f}% | SELL %: {sell_percent:.1f}%
+
+SIGNAL: STRONG BUY - NET BTC > 50!
+            """
+            send_telegram_message(alert)
+        
+        elif net_volume < -50:
+            alert = f"""
+🔴 EXTREME SELL ALERT!
+
+5-Minute Block Analysis
+⏰ {self.block['start_time'].strftime('%H:%M:%S')} → {self.block['end_time'].strftime('%H:%M:%S')}
+
+BUYS: {self.block['buy_count']} trades | {self.block['buy_volume']:.4f} BTC
+SELLS: {self.block['sell_count']} trades | {self.block['sell_volume']:.4f} BTC
+NET VOLUME: {net_volume:.4f} BTC 📉
+
+AVG PRICE: ${avg_price:,.2f}
+BUY %: {buy_percent:.1f}% | SELL %: {sell_percent:.1f}%
+
+SIGNAL: STRONG SELL - NET BTC < -50!
+            """
+            send_telegram_message(alert)
         
         # Save to CSV
         try:
@@ -408,7 +397,7 @@ class BTCAggregator:
         except Exception as e:
             print(f"❌ CSV save error: {e}")
         
-        # Reset for next block
+        # ⭐ Reset block for next interval
         self.reset_block()
 
     # ============================================
@@ -418,7 +407,7 @@ class BTCAggregator:
     def run(self):
         """Main loop"""
         print("="*80)
-        print(f"🚀 BTC AGGREGATOR - WEBSOCKET MODE")
+        print(f"🚀 BTC AGGREGATOR - WEBSOCKET MODE (FIXED)")
         print(f"💰 Symbol: {self.symbol}")
         print(f"📁 CSV: {self.csv_file}")
         print(f"📱 Telegram: {'Enabled' if TELEGRAM_TOKEN else 'Disabled'}")
@@ -427,6 +416,9 @@ class BTCAggregator:
         print("🟢 Connecting to WebSocket...")
         print("="*80 + "\n")
         sys.stdout.flush()
+        
+        # Send connection message
+        send_connection_message()
         
         # Connect to WebSocket
         self.connect_websocket()
@@ -448,7 +440,7 @@ class BTCAggregator:
                 self.ws.close()
         
         # Save final block
-        if self.block['trade_count'] > 0:
+        if self.block['trade_count'] > 0 and not self.block_completed:
             print("\n💾 Saving final block...")
             self.save_and_print_block()
         
@@ -475,9 +467,4 @@ if __name__ == "__main__":
     
     # Start aggregator
     aggregator = BTCAggregator('BTCUSDT')
-    
-    # Send connection message to Telegram
-    time.sleep(2)
-    send_telegram_message(f"🚀 <b>BTC Aggregator Starting...</b>\n⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n💰 Symbol: BTCUSDT\n✅ WebSocket connecting...")
-    
     aggregator.run()
